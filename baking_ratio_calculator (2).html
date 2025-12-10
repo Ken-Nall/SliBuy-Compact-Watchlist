@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Recipe Ratio Calculator</title>
+  <style>
+    body {
+      font-family: sans-serif;
+      margin: 2rem;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-bottom: 1rem;
+    }
+    th, td {
+      border: 1px solid #ccc;
+      padding: 0.5rem;
+      text-align: center;
+    }
+    th {
+      background-color: #f4f4f4;
+    }
+    .status {
+      padding: 0.25rem 0.5rem;
+      border-radius: 4px;
+    }
+    .status.green {
+      background-color: #c8e6c9;
+      color: #2e7d32;
+    }
+    .status.yellow {
+      background-color: #fff9c4;
+      color: #fbc02d;
+    }
+    .status.red {
+      background-color: #ffcdd2;
+      color: #c62828;
+    }
+    .flex-row {
+      display: flex;
+      gap: 1rem;
+      margin-bottom: 1rem;
+      flex-wrap: wrap;
+    }
+    .flex-col {
+      display: flex;
+      flex-direction: column;
+    }
+    label {
+      font-weight: bold;
+      margin-bottom: 0.25rem;
+    }
+    input[type="number"], select {
+      padding: 0.25rem;
+      width: 100px;
+    }
+    .slider-row {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      margin-bottom: 0.5rem;
+    }
+    .slider-row input[type=range] {
+      width: 150px;
+    }
+  </style>
+</head>
+<body>
+  <h1>Cookie Bar Ratio Calculator</h1>
+
+  <div class="flex-row">
+    <div class="flex-col">
+      <label for="profile">Profile</label>
+      <select id="profile" onchange="loadProfile()">
+        <option value="chewy">Chewy</option>
+        <option value="cakey">Cakey</option>
+        <option value="shortbread">Shortbread</option>
+        <option value="custom">Custom</option>
+      </select>
+    </div>
+    <div class="flex-col">
+      <button onclick="saveToLocal()">💾 Save</button>
+      <button onclick="loadFromLocal()">📂 Load</button>
+      <button onclick="cloneToNew()">🧬 Clone to New Type</button>
+    </div>
+  </div>
+
+  <div class="flex-row" id="inputs"></div>
+
+  <h3>Quick Adjust</h3>
+  <div id="sliders"></div>
+
+  <button onclick="calculateRatios()">Calculate</button>
+
+  <h2>Analysis</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Metric</th>
+        <th>Value</th>
+        <th>Status</th>
+        <th>Risk</th>
+      </tr>
+    </thead>
+    <tbody id="results"></tbody>
+  </table>
+
+  <script>
+    const fields = [
+      ['flour', 'Flour (g)'],
+      ['sugar', 'Sugar Total (g)'],
+      ['fat', 'Butter/Oil (g)'],
+      ['egg', 'Egg (g)'],
+      ['liquid', 'Milk/Water (g)'],
+      ['leavener', 'Leavener (g)'],
+      ['dryAddIns', 'Dry Add-ins (e.g. cocoa/powders) (g)'],
+      ['chunks', 'Mix-ins (e.g. chips/nuts) (g)']
+    ];
+
+    const defaultProfiles = {
+      chewy: { flour: 180, sugar: 135, fat: 125, egg: 50, liquid: 30, leavener: 5, dryAddIns: 0, chunks: 40 },
+      cakey: { flour: 180, sugar: 110, fat: 100, egg: 90, liquid: 55, leavener: 6, dryAddIns: 0, chunks: 30 },
+      shortbread: { flour: 180, sugar: 90, fat: 160, egg: 0, liquid: 10, leavener: 0, dryAddIns: 0, chunks: 20 }
+    };
+
+    function init() {
+      loadProfile();
+    }
+
+    function classify(value, ideal, tolerance = 0.1, lowMsg, highMsg) {
+      const diff = value - ideal;
+      if (Math.abs(diff) <= tolerance * ideal) return { status: 'green', note: 'In range' };
+      if (Math.abs(diff) <= tolerance * 2 * ideal) return { status: 'yellow', note: diff < 0 ? lowMsg : highMsg };
+      return { status: 'red', note: diff < 0 ? lowMsg + ' (Severe)' : highMsg + ' (Severe)' };
+    }
+
+    function calculateRatios() {
+      const values = Object.fromEntries(fields.map(([id]) => [id, parseFloat(document.getElementById(id).value)]));
+      const effectiveFlour = values.flour + values.dryAddIns;
+      const structureMass = effectiveFlour + values.egg + values.fat;
+      const selected = document.getElementById('profile').value;
+      const profile = defaultProfiles[selected] || defaultProfiles.chewy;
+
+      const results = [
+        ['Sugar : Flour', values.sugar / effectiveFlour, profile.sugar / (profile.flour + profile.dryAddIns), 'May be dry or not sweet enough', 'Too gooey, won’t set'],
+        ['Fat : Flour', values.fat / effectiveFlour, profile.fat / (profile.flour + profile.dryAddIns), 'Dry and tough', 'Greasy and may not set'],
+        ['Egg : Flour', values.egg / effectiveFlour, profile.egg / (profile.flour + profile.dryAddIns), 'Crumbly, no structure', 'Rubbery or too eggy'],
+        ['Liquid : Flour', values.liquid / effectiveFlour, profile.liquid / (profile.flour + profile.dryAddIns), 'Dry/dense', 'Too wet, may not bake'],
+        ['Leavener : Flour', values.leavener / effectiveFlour, profile.leavener / (profile.flour + profile.dryAddIns), 'Flat, dense', 'Bitter, over-risen'],
+        ['Mix-ins : Structure Mass', values.chunks / structureMass, profile.chunks / (profile.flour + profile.dryAddIns + profile.egg + profile.fat), 'Not enough presence', 'Too many mix-ins, crumbly']
+      ];
+
+      const tbody = document.getElementById('results');
+      tbody.innerHTML = '';
+      results.forEach(([label, val, ideal, lowMsg, highMsg]) => {
+        const { status, note } = classify(val, ideal, 0.1, lowMsg, highMsg);
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td>${label}</td><td>${val.toFixed(2)}</td><td><span class="status ${status}">${status.toUpperCase()}</span></td><td>${note}</td>`;
+        tbody.appendChild(tr);
+      });
+    }
+
+    function loadProfile() {
+      const profile = document.getElementById('profile').value;
+      const preset = defaultProfiles[profile] || {};
+      fields.forEach(([id]) => {
+        const input = document.getElementById(id);
+        if (!input) {
+          const div = document.createElement('div');
+          div.className = 'flex-col';
+          div.innerHTML = `<label for="${id}">${id}</label><input type="number" id="${id}" value="0">`;
+          document.getElementById('inputs').appendChild(div);
+        }
+        const el = document.getElementById(id);
+        el.value = preset[id] ?? 0;
+      });
+
+      const slidersDiv = document.getElementById('sliders');
+      slidersDiv.innerHTML = '';
+      fields.forEach(([id, label]) => {
+        const inputVal = parseFloat(document.getElementById(id).value);
+        const sliderRow = document.createElement('div');
+        sliderRow.className = 'slider-row';
+        sliderRow.innerHTML = `
+          <label>${label}</label>
+          <input type="range" min="0" max="${inputVal * 2}" value="${inputVal}" step="1" oninput="document.getElementById('${id}').value = this.value; calculateRatios()">`
+        ;
+        slidersDiv.appendChild(sliderRow);
+      });
+      calculateRatios();
+    }
+
+    function saveToLocal() {
+      const data = {};
+      fields.forEach(([id]) => {
+        data[id] = parseFloat(document.getElementById(id).value);
+      });
+      localStorage.setItem('recipeCalcSave', JSON.stringify(data));
+      alert('Saved to local storage.');
+    }
+
+    function loadFromLocal() {
+      const data = JSON.parse(localStorage.getItem('recipeCalcSave') || '{}');
+      for (const [id, val] of Object.entries(data)) {
+        if (document.getElementById(id)) document.getElementById(id).value = val;
+      }
+      calculateRatios();
+    }
+
+    function cloneToNew() {
+      const profileName = prompt('Enter name for new profile:');
+      if (!profileName) return;
+      const flour = parseFloat(document.getElementById('flour').value);
+      const dryAddIns = parseFloat(document.getElementById('dryAddIns').value);
+      const newProfile = {
+        flour,
+        sugar: parseFloat(document.getElementById('sugar').value),
+        fat: parseFloat(document.getElementById('fat').value),
+        egg: parseFloat(document.getElementById('egg').value),
+        liquid: parseFloat(document.getElementById('liquid').value),
+        leavener: parseFloat(document.getElementById('leavener').value),
+        dryAddIns,
+        chunks: parseFloat(document.getElementById('chunks').value)
+      };
+      defaultProfiles[profileName] = newProfile;
+      const profileSelect = document.getElementById('profile');
+      const opt = document.createElement('option');
+      opt.value = profileName;
+      opt.text = profileName;
+      profileSelect.appendChild(opt);
+      profileSelect.value = profileName;
+      alert(`Cloned to profile: ${profileName}`);
+    }
+
+    init();
+  </script>
+</body>
+</html>
