@@ -202,6 +202,8 @@
 
     // Countdown + scraping orchestration
     let countdownTimer = null;
+    // Interval used to refresh displayed countdowns for listings (created once)
+    let timeRefreshInterval = null;
     function initiateScrapeWithCountdown(seconds=5) {
         clearInterval(countdownTimer);
         let s = seconds;
@@ -220,7 +222,7 @@
 
     // Determine how many pages to scrape by fetching page 1 and finding page count.
     async function estimateTotalPages() {
-        LOG('Estimating total pages...');
+        LOG('Estimating total pages (enhanced sbar_lbl parsing)...');
         const url = new URL(window.location.href);
         url.searchParams.set('page', '1');
         try {
@@ -228,48 +230,203 @@
             const txt = await res.text();
             const doc = new DOMParser().parseFromString(txt, 'text/html');
 
-            // 1) Try to read a "Displaying 1-100 Of 973" style summary
-            const bodyText = doc.body ? doc.body.innerText : txt;
-            let totalItems = null;
-            // common patterns: "Displaying 1-100 Of 973", "Displaying 1 - 100 Of 973", "Displaying 1 to 100 of 973"
-            const m1 = bodyText.match(/Displaying\s*\d+\s*(?:[-–to]+)\s*\d+\s*Of\s*([\d,]+)/i)
-                    || bodyText.match(/Displaying\s*\d+\s*(?:[-–to]+)\s*\d+\s*of\s*([\d,]+)/i);
-            if (m1) {
-                totalItems = Number((m1[1]||'').replace(/,/g,''));
-                LOG('Found total via "Displaying ..." text:', totalItems);
+            // Try multiple attempts to find the site-specific summary element as the page may be populated asynchronously.
+            // We'll retry fetching & parsing the page a few times with a delay between attempts.
+            try {
+                // Prefer loading the page into an invisible iframe and wait for the site's client-side
+                // scripts to populate the DOM (ensures we're inspecting the *rendered* content).
+                const iframe = document.createElement('iframe');
+                iframe.style.position = 'fixed';
+                iframe.style.left = '0';
+                iframe.style.top = '0';
+                iframe.style.width = '1px';
+                iframe.style.height = '1px';
+                iframe.style.opacity = '0';
+                iframe.style.pointerEvents = 'none';
+                iframe.src = url.toString();
+                iframe.setAttribute('data-sli-estimate-iframe', '1');
+
+                document.body.appendChild(iframe);
+
+                const cleanupIframe = () => {
+                    try { if (iframe && iframe.parentElement) iframe.parentElement.removeChild(iframe); } catch (e) { /* noop */ }
+                };
+
+                // wait for iframe load (same-origin expected)
+                await new Promise((res) => {
+                    const onload = () => { res(); };
+                    iframe.addEventListener('load', onload, { once: true });
+                    // also guard in case load never fires
+                    setTimeout(res, 10000);
+                });
+
+                let foundPages = null;
+                try {
+                    const idoc = iframe.contentDocument || (iframe.contentWindow && iframe.contentWindow.document);
+                    if (idoc) {
+                        // Wait / poll for the sbar element or "Displaying ... Of ..." text to appear
+                        const maxWait = 8000;
+                        const poll = 500;
+                        const start = Date.now();
+                        while (Date.now() - start < maxWait) {
+                            // 1) look for explicit sbar label
+                            const sbar = idoc.querySelector('.pull-left.sbar_lbl, .sbar_lbl');
+                            if (sbar && sbar.innerText && sbar.innerText.trim().length) {
+                                LOG('iframe: sbar_lbl detected:', (sbar.innerText||'').slice(0,200));
+                                // try to extract total items (span.numb or text "Of N")
+                                let totalItems = null;
+                                const totalSpan = sbar.querySelector('.numb, .numb_only');
+                                if (totalSpan && totalSpan.textContent) {
+                                    const raw = totalSpan.textContent.trim().replace(/,/g,'');
+                                    // if it's a range like "1-100" try to find "Of N" in sbar text
+                                    if (raw.includes('-')) {
+                                        const m = sbar.innerText.match(/Of\s*([\d,]+)/i) || sbar.innerText.match(/of\s*([\d,]+)/i);
+                                        if (m) totalItems = Number(m[1].replace(/,/g,''));
+                                    } else {
+                                        const n = Number(raw);
+                                        if (!isNaN(n)) totalItems = n;
+                                    }
+                                } else {
+                                    const m = sbar.innerText.match(/Of\s*([\d,]+)/i) || sbar.innerText.match(/of\s*([\d,]+)/i);
+                                    if (m) totalItems = Number(m[1].replace(/,/g,''));
+                                }
+
+                                if (totalItems && !isNaN(totalItems)) {
+                                    // determine items per page
+                                    let itemsPerPage = 100;
+                                    const rangeSpan = sbar.querySelector('.numb_only');
+                                    if (rangeSpan && rangeSpan.textContent) {
+                                        const r = rangeSpan.textContent.trim();
+                                        const mm = r.match(/(\d+)\s*-\s*(\d+)/);
+                                        if (mm) {
+                                            const low = Number(mm[1]), high = Number(mm[2]);
+                                            if (!isNaN(low) && !isNaN(high) && high >= low) itemsPerPage = (high - low + 1);
+                                        }
+                                    }
+                                    foundPages = Math.max(1, Math.ceil(totalItems / itemsPerPage));
+                                    LOG('iframe -> totalItems:', totalItems, 'itemsPerPage:', itemsPerPage, 'pages:', foundPages);
+                                    break;
+                                }
+                            }
+
+                            // 2) try generic "Displaying 1-100 Of 973" style text anywhere in body
+                            const bodyText = idoc.body ? idoc.body.innerText : '';
+                            const m1 = bodyText.match(/Displaying\s*\d+\s*(?:[-–to]+)\s*\d+\s*(?:Of|of)\s*([\d,]+)/i)
+                                    || bodyText.match(/Displaying\s*\d+\s*(?:[-–to]+)\s*\d+\s*(?:of|Of)\s*([\d,]+)/i);
+                            if (m1) {
+                                const totalItems = Number((m1[1]||'').replace(/,/g,''));
+                                foundPages = Math.max(1, Math.ceil(totalItems / 100));
+                                LOG('iframe found "Displaying ..." text -> totalItems:', totalItems, 'pages:', foundPages);
+                                break;
+                            }
+
+                            // short sleep
+                            await sleep(poll);
+                        }
+                    } else {
+                        LOG('iframe load did not provide document (cross-origin?) - falling back to fetch retries');
+                    }
+                } catch (innerErr) {
+                    LOG('Error while checking iframe document', innerErr);
+                } finally {
+                    cleanupIframe();
+                }
+
+                if (foundPages) return foundPages;
+
+                // If iframe approach did not yield results, fall back to re-fetching and retrying a few times
+                const maxAttempts = 6;
+                const retryMs = 800;
+                let currentTxt = txt;
+                let currentDoc = doc;
+                for (let attempt = 0; attempt < maxAttempts; attempt++) {
+                    const sbar = currentDoc.querySelector('.pull-left.sbar_lbl, .sbar_lbl');
+                    if (sbar) {
+                        LOG(`Found sbar_lbl element (attempt ${attempt+1}/${maxAttempts}):`, (sbar.innerText || '').slice(0,120));
+                        // total count usually in span.numb
+                        const totalSpan = sbar.querySelector('.numb') || sbar.querySelector('.numb_only');
+                        let totalItems = null;
+                        if (totalSpan && totalSpan.textContent) {
+                            const raw = totalSpan.textContent.trim().replace(/,/g, '');
+                            if (/^\d+\s*-\s*\d+$/.test(raw) || raw.includes('-')) {
+                                const m = sbar.innerText.match(/Of\s*([\d,]+)/i) || sbar.innerText.match(/of\s*([\d,]+)/i);
+                                if (m) totalItems = Number(m[1].replace(/,/g,''));
+                            } else {
+                                const n = Number(raw);
+                                if (!isNaN(n)) totalItems = n;
+                            }
+                        } else {
+                            const m = sbar.innerText.match(/Of\s*([\d,]+)/i) || sbar.innerText.match(/of\s*([\d,]+)/i);
+                            if (m) totalItems = Number(m[1].replace(/,/g,''));
+                        }
+                        if (totalItems && !isNaN(totalItems)) {
+                            // determine items-per-page: prefer parsing the range span if present
+                            let itemsPerPage = 100;
+                            const rangeSpan = sbar.querySelector('.numb_only');
+                            if (rangeSpan && rangeSpan.textContent) {
+                                const r = rangeSpan.textContent.trim().replace(/\s/g,'');
+                                const mm = r.match(/(\d+)\s*-\s*(\d+)/);
+                                if (mm) {
+                                    const low = Number(mm[1]), high = Number(mm[2]);
+                                    if (!isNaN(low) && !isNaN(high) && high >= low) itemsPerPage = (high - low + 1);
+                                }
+                            }
+                            const pages = Math.max(1, Math.ceil(totalItems / itemsPerPage));
+                            LOG('sbar_lbl -> totalItems:', totalItems, 'itemsPerPage:', itemsPerPage, 'pages:', pages);
+                            return pages;
+                        }
+                    }
+                    // not found yet -> retry (unless last attempt)
+                    if (attempt < maxAttempts - 1) {
+                        LOG(`sbar_lbl not found (attempt ${attempt+1}/${maxAttempts}), retrying in ${retryMs}ms...`);
+                        await sleep(retryMs);
+                        try {
+                            const r = await fetch(url.toString(), { credentials:'same-origin' });
+                            currentTxt = await r.text();
+                            currentDoc = new DOMParser().parseFromString(currentTxt, 'text/html');
+                        } catch (re) {
+                            LOG('Re-fetch for sbar_lbl attempt failed', re);
+                        }
+                    } else {
+                        LOG('sbar_lbl not found after retries');
+                    }
+                }
+            } catch (e) {
+                LOG('sbar_lbl parse error', e);
             }
 
-            // 2) If not found, try to find a pagination JS call like javascript:searchpaginatee(#) in href or onclick
+            // Fallback 1) Try to read a "Displaying 1-100 Of 973" style summary anywhere in body text
+            const bodyText = doc.body ? doc.body.innerText : txt;
+            let totalItems = null;
+            const m1 = bodyText.match(/Displaying\s*\d+\s*(?:[-–to]+)\s*\d+\s*(?:Of|of)\s*([\d,]+)/i)
+                    || bodyText.match(/Displaying\s*\d+\s*(?:[-–to]+)\s*\d+\s*(?:of|Of)\s*([\d,]+)/i);
+            if (m1) {
+                totalItems = Number((m1[1]||'').replace(/,/g,'')); LOG('Found total via "Displaying ..." text fallback:', totalItems);
+            }
+
+            // Fallback 2) JS pagination helper like searchpaginatee(#) in href/onclick
             if (!totalItems) {
                 const anchors = Array.from(doc.querySelectorAll('a,button'));
                 for (const el of anchors) {
                     const href = el.getAttribute && el.getAttribute('href') || '';
                     const onclick = el.getAttribute && el.getAttribute('onclick') || '';
-                    // check href first (e.g. "javascript:searchpaginatee(12)")
-                    let mm = href.match(/searchpaginatee\(\s*(\d+)\s*\)/i) || onclick.match(/searchpaginatee\(\s*(\d+)\s*\)/i);
+                    let mm = (href && href.match(/searchpaginatee\(\s*(\d+)\s*\)/i)) || (onclick && onclick.match(/searchpaginatee\(\s*(\d+)\s*\)/i));
                     if (mm) {
                         const maxPage = Number(mm[1]);
-                        if (maxPage && !isNaN(maxPage)) {
-                            LOG('Found total pages via searchpaginatee():', maxPage);
-                            return Math.max(1, maxPage);
-                        }
+                        if (maxPage && !isNaN(maxPage)) { LOG('Found total pages via searchpaginatee():', maxPage); return Math.max(1, maxPage); }
                     }
-                    // sometimes the anchor text is the » symbol; the href may still be JS or contain page param
                     if ((el.textContent || '').trim() === '»') {
                         const h = el.getAttribute('href') || '';
                         mm = h.match(/searchpaginatee\(\s*(\d+)\s*\)/i) || h.match(/[?&]page=(\d+)/);
                         if (mm) {
                             const n = Number(mm[1]);
-                            if (n && !isNaN(n)) {
-                                LOG('Found total pages from » anchor:', n);
-                                return Math.max(1, n);
-                            }
+                            if (n && !isNaN(n)) { LOG('Found total pages from » anchor fallback:', n); return Math.max(1, n); }
                         }
                     }
                 }
             }
 
-            // 3) Fallback: try the previous generic pager detection (anchors with page=)
+            // Fallback 3) anchors with page= param
             if (!totalItems) {
                 const pager = doc.querySelectorAll('a[href*="page="]');
                 let maxPage = 1;
@@ -281,12 +438,13 @@
                 return Math.max(1, maxPage);
             }
 
-            // compute pages from totalItems assuming 100 items per page
+            // If we got totalItems via body text fallback - assume 100 per page
             const pages = Math.max(1, Math.ceil(totalItems / 100));
-            LOG('Computed pages from total items:', totalItems, '=>', pages);
+            LOG('Computed pages from total items (final fallback):', totalItems, '=>', pages);
             return pages;
         } catch (e) {
             console.error(e);
+            // safe default
             return 10;
         }
     }
@@ -409,35 +567,29 @@
             return parseTimeStringToEnd(dateStr);
         }
 
-        LOG('parseSearchPage: total containers to iterate:', containers.length);
         containers.forEach((container, idx) => {
             try {
-            LOG(`parseSearchPage: processing container[${idx}] - innerText length:`, (container.innerText||'').slice(0,200).length);
-
             // Auction ID: span.auct-id or text "Auction Id: 5504825"
             let auctionId = null;
             const auctEl = container.querySelector('.auct-id');
             if (auctEl) {
-                const m = auctEl.innerText.match(/Auction\s*Id[:\s]*([0-9]+)/i);
-                if (m) auctionId = m[1];
-                LOG(`parseSearchPage: container[${idx}] found .auct-id ->`, auctionId);
+            const m = auctEl.innerText.match(/Auction\s*Id[:\s]*([0-9]+)/i);
+            if (m) auctionId = m[1];
             }
 
             // fallback: id in title element like ptitle_5504825
             if (!auctionId) {
-                const titleById = container.querySelector('h3[id^="ptitle_"]');
-                if (titleById) {
-                const mid = titleById.id.match(/ptitle_(\d+)/);
-                if (mid) auctionId = mid[1];
-                LOG(`parseSearchPage: container[${idx}] fallback title id ->`, auctionId);
-                }
+            const titleById = container.querySelector('h3[id^="ptitle_"]');
+            if (titleById) {
+            const mid = titleById.id.match(/ptitle_(\d+)/);
+            if (mid) auctionId = mid[1];
+            }
             }
 
             // fallback: search for any digits after text "Auction Id" in container text
             if (!auctionId) {
-                const m2 = container.innerText.match(/Auction\s*Id[:\s]*([0-9]+)/i);
-                if (m2) auctionId = m2[1];
-                LOG(`parseSearchPage: container[${idx}] fallback text match Auction Id ->`, auctionId);
+            const m2 = container.innerText.match(/Auction\s*Id[:\s]*([0-9]+)/i);
+            if (m2) auctionId = m2[1];
             }
 
             // Title: h3.ftnbld (ptitle_), or img alt, or first strong text
@@ -445,81 +597,68 @@
             const h3 = container.querySelector('h3.ftnbld, h3[id^="ptitle_"]');
             if (h3) title = h3.innerText.trim();
             if (!title) {
-                const img = container.querySelector('img[alt]');
-                if (img) title = img.getAttribute('alt').trim();
+            const img = container.querySelector('img[alt]');
+            if (img) title = img.getAttribute('alt').trim();
             }
             if (!title) title = (container.querySelector('.media-body')?.innerText || '').split('\n')[0].trim();
-            LOG(`parseSearchPage: container[${idx}] title ->`, title);
 
             // Image
             const imgEl = container.querySelector('img');
             const imgsrc = imgEl ? (imgEl.getAttribute('data-src') || imgEl.getAttribute('src') || null) : null;
-            LOG(`parseSearchPage: container[${idx}] imgsrc ->`, imgsrc);
 
             // capture image onclick if present (e.g. magnifypopnew)
             const imgOnclick = imgEl && imgEl.getAttribute('onclick') ? imgEl.getAttribute('onclick') : null;
-            if (imgOnclick) LOG(`parseSearchPage: container[${idx}] img onclick ->`, imgOnclick.slice(0,200));
 
             // Price: look for span#price{pid} or .formatCurrency or text "US $X"
             let price = null;
             let rawPriceText = '';
             const priceSpan = Array.from(container.querySelectorAll('[id^="price"], .formatCurrency, .masprice3648327, .buy-price')).find(el => /\d/.test(el.innerText || ''));
             if (priceSpan) {
-                const text = (priceSpan.innerText || '').trim();
-                rawPriceText = text;
-                const m = text.match(/US\s*\$?\s*([0-9\.,]+)/i) || text.match(/([0-9\.,]+)/);
-                if (m) price = (m[1] ? `$${m[1]}` : text);
-                LOG(`parseSearchPage: container[${idx}] priceSpan text ->`, text, 'extracted price ->', price);
+            const text = (priceSpan.innerText || '').trim();
+            rawPriceText = text;
+            const m = text.match(/US\s*\$?\s*([0-9\.,]+)/i) || text.match(/([0-9\.,]+)/);
+            if (m) price = (m[1] ? `$${m[1]}` : text);
             }
             if (!price) {
-                const m = container.innerText.match(/US\s*\$?\s*([0-9\.,]+)/i);
-                if (m) {
-                    rawPriceText = m[0];
-                    price = `$${m[1]}`;
-                }
-                LOG(`parseSearchPage: container[${idx}] fallback price from innerText ->`, price);
+            const m = container.innerText.match(/US\s*\$?\s*([0-9\.,]+)/i);
+            if (m) {
+                rawPriceText = m[0];
+                price = `$${m[1]}`;
+            }
             }
 
             // Time remaining: look for .timer content or hidden input id tim{pid}
             let timeRemaining = '';
             let endsAt = null;
             const timerEl = container.querySelector('.timer, .sch_3648327, .mys');
-            LOG(`parseSearchPage: container[${idx}] timerEl found?`, !!timerEl);
             if (timerEl && timerEl.innerText.trim()) {
-                timeRemaining = timerEl.innerText.trim();
-                LOG(`parseSearchPage: container[${idx}] timerEl text ->`, timeRemaining);
-                const parsed = parseTimeStringToEnd(timeRemaining);
-                if (parsed) endsAt = parsed;
+            timeRemaining = timerEl.innerText.trim();
+            const parsed = parseTimeStringToEnd(timeRemaining);
+            if (parsed) endsAt = parsed;
             } else {
-                // hidden input with end date: id like tim{pid}
-                const hiddenInputs = Array.from(container.querySelectorAll('input')).map(i => i.value).filter(Boolean);
-                LOG(`parseSearchPage: container[${idx}] hidden input values samples ->`, hiddenInputs.slice(0,5));
-                const hiddenTime = hiddenInputs.find(v => /\w+\s+\d{1,2}\s+\d{4}/i.test(v) || /\w{3}\s+\w+\s+\d{2,4}/.test(v) || /\d{4}-\d\d-\d\dT\d\d:\d\d/.test(v));
-                if (hiddenTime) {
-                timeRemaining = hiddenTime;
-                const parsed = tryParseDateOrRelative(hiddenTime);
+            // hidden input with end date: id like tim{pid}
+            const hiddenInputs = Array.from(container.querySelectorAll('input')).map(i => i.value).filter(Boolean);
+            const hiddenTime = hiddenInputs.find(v => /\w+\s+\d{1,2}\s+\d{4}/i.test(v) || /\w{3}\s+\w+\s+\d{2,4}/.test(v) || /\d{4}-\d\d-\d\dT\d\d:\d\d/.test(v));
+            if (hiddenTime) {
+            timeRemaining = hiddenTime;
+            const parsed = tryParseDateOrRelative(hiddenTime);
+            if (parsed) endsAt = parsed;
+            } else {
+            // input with id timNNNN
+            const timInput = Array.from(container.querySelectorAll('input[id^="tim"]')).map(i => i.value).find(Boolean);
+            if (timInput) {
+                timeRemaining = timInput;
+                const parsed = tryParseDateOrRelative(timInput);
                 if (parsed) endsAt = parsed;
-                LOG(`parseSearchPage: container[${idx}] hiddenTime match ->`, hiddenTime, 'parsed endsAt ->', endsAt);
-                } else {
-                // input with id timNNNN
-                const timInput = Array.from(container.querySelectorAll('input[id^="tim"]')).map(i => i.value).find(Boolean);
-                if (timInput) {
-                    timeRemaining = timInput;
-                    const parsed = tryParseDateOrRelative(timInput);
-                    if (parsed) endsAt = parsed;
-                    LOG(`parseSearchPage: container[${idx}] timInput ->`, timInput, 'parsed endsAt ->', endsAt);
-                }
-                }
+            }
+            }
             }
             if (!timeRemaining) {
-                const tm = container.innerText.match(/(\d+\s*d|\d+\s*h|\d+\s*m|\d+\s*s)\b/g);
-                if (tm) {
-                timeRemaining = tm.join(' ');
-                endsAt = parseTimeStringToEnd(timeRemaining);
-                LOG(`parseSearchPage: container[${idx}] regex timeRemaining ->`, timeRemaining, 'endsAt ->', endsAt);
-                } else {
-                LOG(`parseSearchPage: container[${idx}] no timeRemaining found`);
-                }
+            const tm = container.innerText.match(/(\d+\s*d|\d+\s*h|\d+\s*m|\d+\s*s)\b/g);
+            if (tm) {
+            timeRemaining = tm.join(' ');
+            endsAt = parseTimeStringToEnd(timeRemaining);
+            }
             }
 
             // href & onclick capture: try to build a usable link. Capture bidpop onclick string
@@ -527,41 +666,36 @@
             let titleOnclick = null;
             const titleEl = container.querySelector('h3[id^="ptitle_"], h3.ftnbld');
             if (titleEl) {
-                if (titleEl.getAttribute('onclick')) {
-                titleOnclick = titleEl.getAttribute('onclick').trim();
-                LOG(`parseSearchPage: container[${idx}] title onclick ->`, titleOnclick.slice(0,200));
-                // prefer executing the onclick when user clicks in our UI by crafting a javascript: href
-                // wrap to be safe and avoid naked 'this' issues
-                href = `javascript:(function(){try{${titleOnclick};}catch(e){console && console.error && console.error(e);}})()`;
-                }
+            if (titleEl.getAttribute('onclick')) {
+            titleOnclick = titleEl.getAttribute('onclick').trim();
+            // prefer executing the onclick when user clicks in our UI by crafting a javascript: href
+            // wrap to be safe and avoid naked 'this' issues
+            href = `javascript:(function(){try{${titleOnclick};}catch(e){console && console.error && console.error(e);}})()`;
+            }
             }
 
             // fallback: look for an <a> that seems to go to auction page inside container
             if (!href) {
-                const a = container.querySelector('a[href*="auction"], a[href*="product"], a[href*="view"], a[href*="item"], a[href*="watch"]');
-                if (a && a.href) {
-                href = a.href;
-                LOG(`parseSearchPage: container[${idx}] found anchor href ->`, href);
-                }
+            const a = container.querySelector('a[href*="auction"], a[href*="product"], a[href*="view"], a[href*="item"], a[href*="watch"]');
+            if (a && a.href) {
+            href = a.href;
+            }
             }
             // ultimate fallback: craft a search query link to the auction id or attach as query param
             if (!href && auctionId) {
-                href = `${location.origin}${location.pathname}?auctionid=${auctionId}`;
-                LOG(`parseSearchPage: container[${idx}] crafted fallback href ->`, href);
+            href = `${location.origin}${location.pathname}?auctionid=${auctionId}`;
             }
 
             // Final auctionId fallback: try to get numeric from any id-like string
             if (!auctionId) {
-                const alt = (container.innerText || '').match(/(\d{6,})/);
-                if (alt) {
-                auctionId = alt[1];
-                LOG(`parseSearchPage: container[${idx}] final numeric fallback auctionId ->`, auctionId);
-                }
+            const alt = (container.innerText || '').match(/(\d{6,})/);
+            if (alt) {
+            auctionId = alt[1];
+            }
             }
 
             if (!auctionId && !title) {
-                LOG(`parseSearchPage: container[${idx}] skipping - no auctionId and no title`);
-                return; // skip if nothing meaningful
+            return; // skip if nothing meaningful
             }
 
             // MSRP extraction from title (e.g. "$99 MSRP" or "99 MSRP", case-insensitive)
@@ -569,34 +703,31 @@
             let msrpVal = null;
             const msrpMatch = (title || '').match(/\$?\s*([0-9\.,]+)\s*MSRP\b/i);
             if (msrpMatch) {
-                msrpRaw = msrpMatch[0];
-                msrpVal = Number(msrpMatch[1].replace(/,/g,''));
-                LOG(`parseSearchPage: container[${idx}] MSRP parsed ->`, msrpRaw, msrpVal);
+            msrpRaw = msrpMatch[0];
+            msrpVal = Number(msrpMatch[1].replace(/,/g,''));
             }
 
             // Compute percentage of MSRP will be computed later based on increased price
             const item = {
-                auctionId: String(auctionId || (`${Math.random().toString(36).slice(2,10)}`)),
-                title: title || 'Unknown',
-                href: href || location.href,
-                imgsrc,
-                imgOnclick,
-                titleOnclick, // original bidpop(...) string if present
-                price: price || '',
-                rawPrice: rawPriceText || (price || ''),
-                msrpRaw,
-                msrpValue: msrpVal,
-                percentOfMsrp: null,
-                timeRemaining: timeRemaining || '',
-                endsAt: endsAt || null,
-                rawHtml: (container.innerHTML || '').slice(0,1000),
-                scrapedAt: Date.now()
+            auctionId: String(auctionId || (`${Math.random().toString(36).slice(2,10)}`)),
+            title: title || 'Unknown',
+            href: href || location.href,
+            imgsrc,
+            imgOnclick,
+            titleOnclick, // original bidpop(...) string if present
+            price: price || '',
+            rawPrice: rawPriceText || (price || ''),
+            msrpRaw,
+            msrpValue: msrpVal,
+            percentOfMsrp: null,
+            timeRemaining: timeRemaining || '',
+            endsAt: endsAt || null,
+            rawHtml: (container.innerHTML || '').slice(0,1000),
+            scrapedAt: Date.now()
             };
 
-            LOG(`parseSearchPage: container[${idx}] parsed item ->`, { auctionId: item.auctionId, title: item.title, href: item.href, price: item.price, timeRemaining: item.timeRemaining, imgsrc: item.imgsrc, msrp: item.msrpValue });
             items.push(item);
             } catch (e) {
-            LOG('parseSearchPage: container error at index', idx, e);
             }
         });
 
@@ -916,10 +1047,15 @@
             const titleCell = document.createElement('td');
             titleCell.innerHTML = `<span class='sliTitle' data-id='${it.auctionId}' style='cursor:pointer'>${escapeHtml(it.title)}</span>`;
             if (isTarget) titleCell.classList.add('sliTarget');
-            if (isBlack) titleCell.classList.add('sliBlacklisted');
-
             const timeCell = document.createElement('td');
-            timeCell.textContent = it.timeRemaining|| (it.endsAt ? msUntil(it.endsAt) : '');
+            // Prefer dynamic display from absolute timestamp if available so the UI will countdown.
+            if (it.endsAt) {
+                timeCell.textContent = msUntil(it.endsAt);
+                // mark for periodic refresh
+                timeCell.dataset.endsAt = String(it.endsAt);
+            } else {
+                timeCell.textContent = it.timeRemaining || '';
+            }
 
             const bulkCell = document.createElement('td');
             if (bulkCount>1) {
@@ -990,8 +1126,24 @@
                     const r = await fetch(it.href, { credentials:'same-origin' });
                     const t = await r.text();
                     const parsed = parseSearchPage(t);
-                    // find matching auctionId
-                    const found = parsed.find(p=>p.auctionId === it.auctionId) || parsed[0];
+        tableArea.innerHTML = '';
+        tableArea.appendChild(table);
+        // Ensure a single interval updates any time cells that use endsAt
+        if (!timeRefreshInterval) {
+            timeRefreshInterval = setInterval(() => {
+                try {
+                    const tds = tableArea.querySelectorAll('td[data-ends-at]');
+                    tds.forEach(td => {
+                        const ts = Number(td.dataset.endsAt);
+                        if (!isNaN(ts)) td.textContent = msUntil(ts);
+                    });
+                } catch (e) {
+                    // defensive: if tableArea is removed or something unexpected happens, clear interval
+                    clearInterval(timeRefreshInterval);
+                    timeRefreshInterval = null;
+                }
+            }, 1000);
+        }
                     if (found) { cache[it.auctionId] = Object.assign(cache[it.auctionId]||{}, found); saveCache(cache); renderListings(showScraperWatch); }
                 } catch (e) { console.error(e); }
             });
