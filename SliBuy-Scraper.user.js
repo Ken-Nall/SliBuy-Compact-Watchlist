@@ -1068,7 +1068,39 @@
                 b.addEventListener('click', ()=> renderBulkOnly(groups[bulkKey]));
                 bulkCell.appendChild(b);
             }
+            // Add a single global "Clear Cache" button (created once per render)
+            if (!document.getElementById('sliClearCacheBtn')) {
+                const clearBtn = document.createElement('button');
+                clearBtn.id = 'sliClearCacheBtn';
+                clearBtn.textContent = 'Clear Cache';
+                clearBtn.title = 'Clear cached scraped items';
+                clearBtn.style.marginLeft = '8px';
+                clearBtn.style.background = '#e53e3e';
+                clearBtn.style.color = '#fff';
+                clearBtn.style.border = 'none';
+                clearBtn.style.padding = '4px 8px';
+                clearBtn.style.borderRadius = '4px';
+                clearBtn.style.cursor = 'pointer';
 
+                clearBtn.addEventListener('click', () => {
+                    if (!confirm('Clear cached scraped items?')) return;
+                    try {
+                        localStorage.removeItem(STORAGE_CACHE_KEY);
+                        cache = {};
+                        saveCache(cache);
+                        info.textContent = 'Cache cleared';
+                        // re-render the listings view
+                        renderListings();
+                    } catch (e) {
+                        console.error('Failed to clear cache', e);
+                        alert('Failed to clear cache. See console for details.');
+                    }
+                });
+
+                const controls = document.getElementById('sliControls');
+                if (controls) controls.appendChild(clearBtn);
+                else panel.insertBefore(clearBtn, panel.firstChild);
+            }
             const watchCell = document.createElement('td');
             const watchBtn = document.createElement('button');
             watchBtn.className = 'sliWatchBtn';
